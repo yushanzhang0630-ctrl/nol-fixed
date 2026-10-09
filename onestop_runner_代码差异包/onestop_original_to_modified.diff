@@ -1,0 +1,463 @@
+--- onestop_baseline_(1).py
++++ onestop_modified_(general-ver).py
+@@ -82,55 +82,170 @@
+         result.append(s)
+     return result
+ 
+ 
+ def wait_and_focus_seatmap(driver, timeout=20, log=None):
+-    """等座位图加载出来。返回找到的座位数。
+-
+-    新版 onestop 座位直接在主文档,不在 iframe。
++    """等待新版 NOL SeatMap 基本稳定后再返回。
++
++    React 会先渲染少量 circle.js-seat，随后继续批量加入座位。
++    因此不能只看到第一个 circle 就立即开始选座。
+     """
++
+     import time
+     from selenium.webdriver.common.by import By
+ 
+     def _log(m):
+         if log:
+             log(m)
+ 
+-    driver.switch_to.default_content()  # 确保在主文档
++    driver.switch_to.default_content()
++
+     deadline = time.time() + timeout
++
++    last_total = -1
++    stable_since = None
++    first_seen = None
++    last_reported = -1
++
+     while time.time() < deadline:
+-        n = len(driver.find_elements(By.CSS_SELECTOR, "circle.js-seat"))
+-        if n > 0:
+-            _log(f"主文档找到 {n} 个座位")
+-            return n
+-        time.sleep(0.5)
+-    _log("等了 %d 秒仍没找到 circle.js-seat" % timeout)
++        try:
++            total = len(
++                driver.find_elements(
++                    By.CSS_SELECTOR,
++                    "circle.js-seat"
++                )
++            )
++
++            selectable = len(
++                driver.find_elements(
++                    By.CSS_SELECTOR,
++                    'circle.js-seat:not([class*="disabled"])'
++                )
++            )
++
++            if total > 0:
++                if first_seen is None:
++                    first_seen = time.time()
++                    stable_since = time.time()
++
++                # 座位数量发生变化，说明 React 还在继续加载
++                if total != last_total:
++                    last_total = total
++                    stable_since = time.time()
++
++                    # 只在数量变化时输出，避免刷屏
++                    if total != last_reported:
++                        _log(
++                            f"SeatMap 正在加载："
++                            f"circle={total}，可选={selectable}"
++                        )
++                        last_reported = total
++
++                # 已经出现可选座位，并且至少稳定观察了一小段时间
++                if (
++                    selectable > 0
++                    and first_seen is not None
++                    and time.time() - first_seen >= 0.8
++                ):
++                    _log(
++                        f"主文档找到 {total} 个座位，"
++                        f"其中可选 {selectable} 个"
++                    )
++                    return total
++
++                # 没有可选座位时，不要看到第一个 circle 就结束。
++                # 等数量稳定一段时间后再判断。
++                if (
++                    stable_since is not None
++                    and first_seen is not None
++                    and time.time() - first_seen >= 1.5
++                    and time.time() - stable_since >= 1.0
++                ):
++                    _log(
++                        f"SeatMap 已基本稳定："
++                        f"circle={total}，可选={selectable}"
++                    )
++                    return total
++
++        except Exception as e:
++            _log(f"扫描 SeatMap 时出现异常：{e}")
++
++        time.sleep(0.2)
++
++    _log(f"等了 {timeout} 秒仍未完成 SeatMap 加载")
+     return 0
+ 
+ 
+ # ---- 选座:旧站(interpark) vs 新站(nol) 双模式 ----
+ 
+ def choose_seat_auto(driver, want_count=1, log=None):
+-    """自动判断旧站/新站,选择对应的选座逻辑。
+-
+-    旧站(interpark/globalinterpark):iframe + area 区域选座
+-    新站(nol):SVG circle.js-seat 直接选座
+-    """
+-    import logging
++    """自动判断旧版 Interpark / 新版 NOL 选座页面。"""
++    import time
++    from selenium.webdriver.common.by import By
++
+     if log is None:
+         log = lambda m: None
+ 
+-    url = driver.current_url.lower()
++    log("========== choose_seat_auto 已执行 ==========")
++
++    try:
++        driver.switch_to.default_content()
++    except Exception as e:
++        log(f"切换主文档失败: {e}")
++
++    # =========================================================
++    # 第一阶段：先立即检查新版 NOL SeatMap
++    # =========================================================
++    try:
++        seats = driver.find_elements(
++            By.CSS_SELECTOR,
++            "circle.js-seat"
++        )
++
++        log(f"当前立即检测到 circle.js-seat 数量: {len(seats)}")
++
++        if seats:
++            log("检测到新版 NOL SVG 选座页面")
++            return choose_best_seat(driver, want_count, log)
++
++    except Exception as e:
++        log(f"立即检测新版 NOL 页面时出现异常: {e}")
++
++    # =========================================================
++    # 第二阶段：如果还没有座位，等待页面自动跳转/SeatMap加载
++    # =========================================================
++    log("尚未发现座位图，等待 NOL 自动进入选座页面……")
++
++    seat_count = wait_and_focus_seatmap(
++        driver,
++        timeout=30,
++        log=log
++    )
++
++    if seat_count > 0:
++        log(f"新版 NOL SeatMap 已加载，共发现 {seat_count} 个座位")
++        return choose_best_seat(driver, want_count, log)
++
++    # =========================================================
++    # 第三阶段：30 秒后仍然没有新版 SeatMap，再判断旧版
++    # =========================================================
++    try:
++        url = driver.current_url.lower()
++        log(f"等待结束后的 URL: {url}")
++    except Exception:
++        url = ""
++
++    if "interpark.com" in url:
++        log("等待后检测到旧版 Interpark 选座页面")
++        return choose_seat_old(driver, want_count, log)
++
+     if "nol.com" in url:
+-        log("检测到新站(NOL),使用 SVG 选座逻辑")
+-        return choose_best_seat(driver, want_count, log)
+-    elif "interpark.com" in url:
+-        log("检测到旧站(Interpark),使用区域选座逻辑")
+-        return choose_seat_old(driver, want_count, log)
+-    else:
+-        log(f"未识别的域名:{url},尝试新站逻辑")
+-        return choose_best_seat(driver, want_count, log)
++        log("等待 30 秒后仍在 NOL 页面，未发现新版 SeatMap")
++        return 0
++
++    log(f"等待后仍无法识别页面: {url}")
++    return 0
+ 
+ 
+ def choose_seat_old(driver, want_count=1, log=None):
+     """旧站(interpark)选座逻辑:遍历所有区域,找到有票的就点。
+ 
+@@ -613,27 +728,93 @@
+     found = wait_and_focus_seatmap(driver, log=log)
+     if found == 0:
+         return []
+ 
+     html = driver.page_source
+-    colors = preferred_colors(html)
+-    if not colors:
+-        # 图例没解析到，就不分档，按有颜色的可选座位来
+-        colors = [None]
++
++    # 解析票档：颜色、名称、价格
++    grades = parse_grades(html)
++
++    if grades:
++        log("当前票档排序（从贵到便宜）：")
++        for color, name, price in grades:
++            log(f"  {name} | {price:,} | {color}")
++
++        grade_items = grades
++    else:
++        log("未解析到票档图例，无法进行价格排序。")
++        grade_items = [(None, "未识别票档", 0)]
++
++    # ---------------------------------------------------------
++    # 提速：整张 SVG 只扫描一次，然后按颜色分组
++    # ---------------------------------------------------------
++    all_seats = driver.find_elements(
++        By.CSS_SELECTOR,
++        _SELECTABLE_CSS
++    )
++
++    seats_by_color = {}
++
++    for seat in all_seats:
++        try:
++            fill = (seat.get_attribute("fill") or "").lower()
++
++            # 排除售罄/灰色座位
++            if fill == SOLD_FILL:
++                continue
++
++            seats_by_color.setdefault(fill, []).append(seat)
++
++        except Exception:
++            continue
++
++    log(f"本次座位图共扫描 {len(all_seats)} 个可选候选元素")
+ 
+     picked = []
+-    for color in colors:
+-        seats = find_selectable_seats(driver, color)
+-        log(f"该档有 {len(seats)} 个可选座位，尝试点击……")
++
++    # 仍然严格按照价格从高到低检查
++    for color, grade_name, grade_price in grade_items:
++
++        if color is None:
++            seats = [
++                seat
++                for seat_list in seats_by_color.values()
++                for seat in seat_list
++            ]
++        else:
++            seats = seats_by_color.get(color.lower(), [])
++
++        log(
++            f"当前检查：{grade_name} | "
++            f"{grade_price:,} | {color} | "
++            f"可选座位：{len(seats)}"
++        )
++
+         for seat in seats:
+             if len(picked) >= want_count:
+                 break
+-            seat_id = seat.get_attribute("id")
+-            if _click_seat(driver, seat):
+-                picked.append(seat_id)
+-                log(f"已选中座位：{seat_id}")
+-                time.sleep(0.3)  # 给页面一点反应时间
++
++            try:
++                seat_id = seat.get_attribute("id")
++                seat_fill = (seat.get_attribute("fill") or "").lower()
++
++                log(
++                    f"尝试点击：{seat_id} | "
++                    f"票档={grade_name} | "
++                    f"价格={grade_price:,} | "
++                    f"颜色={seat_fill}"
++                )
++
++                if _click_seat(driver, seat):
++                    picked.append(seat_id)
++                    log(f"已选中座位：{seat_id}")
++                    time.sleep(0.3)
++
++            except Exception as e:
++                log(f"处理座位失败：{e}")
++                continue
++
+         if len(picked) >= want_count:
+             break
+     if not picked:
+         log("找到了可选座位但都点不中（可能需要真实鼠标事件/被遮挡）。")
+         return []
+@@ -644,54 +825,119 @@
+     _click_seat_confirm(driver, log)
+     return picked
+ 
+ 
+ def _click_seat_confirm(driver, log):
+-    """选座确认后,点"完成選擇"按钮进入选数量/价格页。
+-
+-    React页面元素引用会stale,每次点击前重新查找。
+-    跳转判定:不看座位图(选数量页也有座位图),看"完成選擇"按钮消失 或 加号按钮出现。
++    """选座确认后，点击「完成選擇」按钮进入选数量页。
++
++    React 页面可能在点击前后重新渲染，因此每次尝试都重新获取按钮。
+     """
++
+     import time
+     from selenium.webdriver.common.by import By
+     from selenium.webdriver.common.action_chains import ActionChains
+ 
+     log("查找「完成選擇」按钮……")
++
+     deadline = time.time() + 8
+ 
+     while time.time() < deadline:
+         try:
+-            # 每次循环重新查找,避免stale
+-            btns = driver.find_elements(By.CSS_SELECTOR, "button.EntButton_primary__UOX1_, button.entButtonGlobal")
++            # 每轮都重新获取按钮，不保存旧元素
++            btns = driver.find_elements(
++                By.CSS_SELECTOR,
++                "button.EntButton_primary__UOX1_, button.entButtonGlobal"
++            )
++
++            target = None
++
+             for btn in btns:
+-                txt = (btn.text or "").strip()
+-                is_disabled = btn.get_attribute("disabled")
+-
+-                if ("完成" in txt or "選擇" in txt or "选择" in txt.lower()) and not is_disabled:
+-                    log(f"找到可点按钮:「{txt}」,尝试点击……")
+-                    # 先滚动到可见
+-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+-                    time.sleep(0.2)
+-                    # 用ActionChains真实点击(对React更稳)
+-                    ActionChains(driver).move_to_element(btn).pause(0.1).click().perform()
+-                    time.sleep(1)
+-
+-                    # 验证是否跳页:看"完成選擇"按钮是否消失 或 加号按钮出现
+-                    confirm_btns = driver.find_elements(By.CSS_SELECTOR, "button")
+-                    confirm_gone = not any("完成" in (b.text or "") and "選擇" in (b.text or "") for b in confirm_btns)
+-                    inc_btns = driver.find_elements(By.CSS_SELECTOR, "button[class*='incrementButton']")
+-
+-                    if confirm_gone or len(inc_btns) > 0:
+-                        log("已跳转到选数量页")
+-                        return True
+-                    log("点击后未检测到跳转,重试……")
++                try:
++                    txt = (btn.text or "").strip()
++                    disabled = btn.get_attribute("disabled")
++
++                    if (
++                            ("完成" in txt or "選擇" in txt or "选择" in txt)
++                            and not disabled
++                    ):
++                        target = btn
++                        break
++
++                except Exception:
++                    # 单个按钮如果刚好被 React 替换，直接重新找
++                    continue
++
++            if target is None:
++                time.sleep(0.2)
++                continue
++
++            log("找到可点按钮，准备真实点击……")
++
++            # 不再先用 JS scrollIntoView。
++            # ActionChains 的 move_to_element 会自动尝试把按钮带入可视区域。
++            try:
++                ActionChains(driver) \
++                    .move_to_element(target) \
++                    .pause(0.1) \
++                    .click() \
++                    .perform()
++
++            except Exception as e:
++                log(f"点击「完成選擇」异常：{e}")
++                time.sleep(0.2)
++                continue
++
++            # 点击后给 React 一点时间更新
++            time.sleep(0.5)
++
++            # 判断是否已经进入选数量页
++            try:
++                inc_btns = driver.find_elements(
++                    By.CSS_SELECTOR,
++                    "button[class*='incrementButton']"
++                )
++
++                if inc_btns:
++                    log("已进入选数量页")
++                    return True
++
++            except Exception:
++                pass
++
++            # 如果「完成選擇」按钮已经不存在，也认为成功
++            try:
++                remaining = driver.find_elements(
++                    By.CSS_SELECTOR,
++                    "button.EntButton_primary__UOX1_, button.entButtonGlobal"
++                )
++
++                still_confirm = False
++
++                for btn in remaining:
++                    try:
++                        txt = (btn.text or "").strip()
++                        if "完成" in txt and "選擇" in txt:
++                            still_confirm = True
++                            break
++                    except Exception:
++                        continue
++
++                if not still_confirm:
++                    log("「完成選擇」按钮已消失，确认成功")
++                    return True
++
++            except Exception:
++                pass
++
++            log("点击后暂未确认成功，重新查找按钮……")
++
+         except Exception as e:
+-            log(f"点击异常(可能stale):{e},重新查找……")
+-
+-        time.sleep(0.5)
+-
+-    log("等了8秒,未能成功跳转")
++            log(f"确认按钮处理异常：{e}")
++
++        time.sleep(0.3)
++
++    log("等了8秒，仍未确认「完成選擇」成功")
+     return False
+ 
+ 
+ def _click_seat(driver, seat):
+     """点一个 SVG 座位并验证是否真的被选中。
+@@ -1099,5 +1345,6 @@
+         try:
+             driver.execute_script("arguments[0].click();", btn)
+             return
+         except Exception:
+             pass
++

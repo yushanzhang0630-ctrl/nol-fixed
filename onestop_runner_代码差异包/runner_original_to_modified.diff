@@ -1,0 +1,91 @@
+--- runner_baseline_(1).py
++++ runner_modified_(general-ver).py
+@@ -98,30 +98,25 @@
+     options.add_argument("--disable-blink-features=AutomationControlled")
+     return options
+ 
+ 
+ def make_driver(say=None):
+-    """开 Chrome。先试固定 profile；被占用就退回无 profile，并把原因说清。"""
++    """使用项目自己的固定 Chrome Profile，保留 NOL 登录状态。"""
+     from selenium import webdriver
+ 
+     def _log(m):
+         logging.info(m)
+         if say:
+             say(m)
+ 
+     try:
+         return webdriver.Chrome(options=_build_options(use_profile=True))
+     except Exception as e:
+-        _log(f"用固定配置开 Chrome 失败：{e}")
+-        _log("多半是 Chrome 已经开着（配置目录被占用）。")
+-        _log("正在改用临时配置重试（这样就得每次手动登录）……")
+-        try:
+-            return webdriver.Chrome(options=_build_options(use_profile=False))
+-        except Exception as e2:
+-            _log(f"再次失败：{e2}")
+-            _log("请确认：1) 已装 Google Chrome  2) 先关掉所有 Chrome 窗口再试。")
+-            raise
++        _log(f"固定 Chrome Profile 启动失败：{e}")
++        _log("请先关闭所有由本脚本打开的 Chrome 窗口，再点击「开始」。")
++        _log("本次不会改用临时 Profile，以免丢失 NOL 登录状态。")
++        raise
+ 
+ 
+ def _app_dir():
+     import sys
+ 
+@@ -153,10 +148,52 @@
+     driver.get("https://world.nol.com/zh-CN/ticket")
+ 
+     # 阻塞，等你手动操作到验证码页再点「接手」
+     if wait_takeover:
+         wait_takeover()
++
++    # 接手后，等待并切换到真正的 Interpark 选座页面
++    say("已接手，正在寻找选座页面……")
++
++    seat_handle = None
++    deadline = time.time() + 15
++
++    while time.time() < deadline and seat_handle is None:
++        try:
++            handles = driver.window_handles
++
++            for handle in handles:
++                try:
++                    driver.switch_to.window(handle)
++                    url = driver.current_url.lower()
++
++                    if "tickets.interpark.com/onestop/seat" in url:
++                        seat_handle = handle
++                        break
++
++                except Exception:
++                    continue
++
++        except Exception as e:
++            say(f"检查浏览器窗口失败：{e}")
++
++        if seat_handle is None:
++            time.sleep(0.5)
++
++    if seat_handle is None:
++        say("15 秒内没有找到 tickets.interpark.com/onestop/seat")
++        try:
++            for i, handle in enumerate(driver.window_handles):
++                driver.switch_to.window(handle)
++                say(f"窗口{i}: {driver.current_url}")
++        except Exception:
++            pass
++        alarm()
++        return
++
++    driver.switch_to.window(seat_handle)
++    say(f"已切换到选座页面：{driver.current_url}")
+     say("已接手，开始自动处理……")
+ 
+     # 1) 验证码
+     kind = onestop.detect_captcha(driver)
+     if kind == onestop.CAPTCHA_TEXT:
